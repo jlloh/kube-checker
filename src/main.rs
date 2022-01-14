@@ -7,9 +7,18 @@ use kube::{
 };
 use tabled::{Table, Tabled};
 
+#[derive(Debug, Clone)]
+struct InputObject {
+    name: String,
+    namespace: String,
+    type_of: String,
+    pod_spec: PodSpec,
+}
+
 #[derive(Debug, Tabled)]
 struct TaggedObject {
     name: String,
+    namespace: String,
     type_of: String,
     container_name: String,
     node_selector_check: bool,
@@ -19,7 +28,6 @@ struct TaggedObject {
 
 #[tokio::main]
 async fn main() -> () {
-    // Infer the runtime environment and try to create a Kubernetes Client
     let client = Client::try_default()
         .await
         .expect("Expected client init succeed");
@@ -43,17 +51,12 @@ async fn main() -> () {
         waiters_statefulsets.push(handle_statefulsets);
     }
 
-    let results_deployments: Vec<Deployment> = try_join_all(waiters_deployments)
+    let results_deployments: Vec<InputObject> = try_join_all(waiters_deployments)
         .await
         .expect("Expected successful execution of async get deployments")
         .iter()
         .flatten()
         .map(|x| x.clone())
-        .collect();
-    // .filter(|x| filter_deployments(x))
-
-    let tagged: Vec<TaggedObject> = results_deployments
-        .into_iter()
         .map(|deployment| {
             let pod_spec = deployment
                 .clone()
@@ -67,35 +70,65 @@ async fn main() -> () {
                 .metadata
                 .name
                 .expect("Expected valid name");
-            tag_object(name.clone(), "deployment".to_string(), &pod_spec)
+            let namespace = deployment
+                .clone()
+                .metadata
+                .namespace
+                .expect("Expected namespace value");
+            InputObject {
+                name,
+                namespace,
+                type_of: "deployment".to_string(),
+                pod_spec,
+            }
         })
+        .collect();
+
+    let results_statefulsets: Vec<InputObject> = try_join_all(waiters_statefulsets)
+        .await
+        .expect("Expected successful execution of async get statefulsets")
+        .iter()
+        .flatten()
+        .map(|x| x.clone())
+        .map(|statefulset| {
+            let pod_spec = statefulset
+                .clone()
+                .spec
+                .expect("Expected statefulset spec")
+                .template
+                .spec
+                .expect("Expected podspec");
+            let name = statefulset
+                .clone()
+                .metadata
+                .name
+                .expect("Expected valid name");
+            let namespace = statefulset
+                .clone()
+                .metadata
+                .namespace
+                .expect("Expected namespace value");
+            InputObject {
+                name,
+                namespace,
+                type_of: "statefulset".to_string(),
+                pod_spec,
+            }
+        })
+        .collect();
+
+    let mut full_results = results_deployments.clone();
+    full_results.append(&mut results_statefulsets.clone());
+
+    let tagged: Vec<TaggedObject> = full_results
+        .into_iter()
+        .map(|input| tag_object(input.name, input.namespace, input.type_of, &input.pod_spec))
         .flatten()
         .filter(|x| !x.image_check || !x.node_selector_check || !x.qos_check)
         .collect();
 
     let table = Table::new(tagged).to_string();
     println!("{}", table);
-
-    // // TODO: Refactor this to avoid copy pasta
-    // let results_statefulsets: Vec<StatefulSet> = try_join_all(waiters_statefulsets)
-    //     .await
-    //     .expect("Expected successful execution of async get deployments")
-    //     .iter()
-    //     .flatten()
-    //     .map(|x| x.clone())
-    //     .filter(|x| filter_statefulsets(x))
-    //     .collect();
-
-    // for statefulset in results_statefulsets {
-    //     let metadata = statefulset.metadata;
-    //     let name = metadata.clone().name.expect("Expected valid name");
-    //     let namespace = metadata
-    //         .clone()
-    //         .namespace
-    //         .expect("Expected valid namespace");
-
-    //     println!("Statefulset {} in namespace {}", name, namespace);
-    // }
 }
 
 async fn get_deployments(client: Client, namespace: String) -> ObjectList<Deployment> {
@@ -106,7 +139,6 @@ async fn get_deployments(client: Client, namespace: String) -> ObjectList<Deploy
         .await
         .expect("Expected results for deployment list");
     return deployment_list;
-    // let results = deployment_list.iter()
 }
 
 // Copy pasta for now
@@ -118,55 +150,17 @@ async fn get_statefulsets(client: Client, namespace: String) -> ObjectList<State
         .await
         .expect("Expected results for deployment list");
     return deployment_list;
-    // let results = deployment_list.iter()
 }
 
-// fn filter_function(pod: &Pod) -> bool {
-//     let no_node_selector = pod
-//         .clone()
-//         .spec
-//         .expect("Expected spec")
-//         .node_selector
-//         .is_none();
-//     return no_node_selector;
-//     // return true;
-// }
-
-fn filter_deployments(deployment: &Deployment) -> bool {
-    let pod_spec = deployment
-        .clone()
-        .spec
-        .expect("Expected deployment spec")
-        .template
-        .spec
-        .expect("Expected spec");
-    let no_node_selector = pod_spec.clone().node_selector.is_none();
+fn tag_object(
+    name: String,
+    namespace: String,
+    type_of: String,
+    pod_spec: &PodSpec,
+) -> Vec<TaggedObject> {
     // qos class BestEffort?
     // let bad_qos_class = pod_spec.clone().
     // dockerhub image
-    return no_node_selector;
-}
-
-fn filter_statefulsets(deployment: &StatefulSet) -> bool {
-    let pod_spec = deployment
-        .clone()
-        .spec
-        .expect("Expected deployment spec")
-        .template
-        .spec
-        .expect("Expected spec");
-    let no_node_selector = pod_spec.clone().node_selector.is_none();
-    // qos class BestEffort?
-    // let bad_qos_class = pod_spec.clone().
-    // dockerhub image
-    return no_node_selector;
-}
-
-fn tag_object(name: String, type_of: String, pod_spec: &PodSpec) -> Vec<TaggedObject> {
-    // qos class BestEffort?
-    // let bad_qos_class = pod_spec.clone().
-    // dockerhub image
-    // let mut result = Vec::new();
     let node_selector_check = pod_spec.clone().node_selector.is_some();
     let containers = pod_spec.clone().containers;
     let results: Vec<TaggedObject> = containers
@@ -181,6 +175,7 @@ fn tag_object(name: String, type_of: String, pod_spec: &PodSpec) -> Vec<TaggedOb
             };
             TaggedObject {
                 name: name.clone(),
+                namespace: namespace.clone(),
                 type_of: type_of.clone(),
                 container_name,
                 node_selector_check,
@@ -288,6 +283,7 @@ mod tests {
 
         let tagged_result = tag_object(
             "random name".to_string(),
+            "namespace".to_string(),
             "deployment".to_string(),
             &pod_spec,
         );
