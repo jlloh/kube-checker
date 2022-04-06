@@ -1,3 +1,4 @@
+use clap::Parser;
 use csv::Writer;
 use futures::future::try_join_all;
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
@@ -8,7 +9,23 @@ use kube::{
 };
 use serde::{Deserialize, Serialize};
 use tabled::{Table, Tabled};
+
 mod utils;
+
+/// Clap command line arguments
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    /// Disable filters so that all pods are displayed
+    #[clap(long, takes_value = false)]
+    disable_filter: bool,
+    /// Generate a csv file in the directory, foo.csv
+    #[clap(long, takes_value = false)]
+    generate_csv: bool,
+    /// Print out the table to stdout
+    #[clap(long, takes_value = false)]
+    print_table: bool,
+}
 
 #[derive(Debug, Clone)]
 struct InputObject {
@@ -35,6 +52,8 @@ struct TaggedObject {
 
 #[tokio::main]
 async fn main() -> () {
+    let args = Args::parse();
+
     let client = Client::try_default()
         .await
         .expect("Expected client init succeed");
@@ -169,14 +188,22 @@ async fn main() -> () {
         .collect();
 
     // Sort by resources without filtering
-    let table = Table::new(&tagged).to_string();
-    // let table = Table::new(filtered).to_string();
-    println!("{}", table);
+    let table: String;
+    if args.disable_filter {
+        table = Table::new(&tagged).to_string();
+    } else {
+        table = Table::new(&filtered).to_string();
+    }
 
-    // Write to csv?
-    let mut wtr = Writer::from_path("foo.csv").expect("expected valid csv writer");
-    for i in &tagged {
-        wtr.serialize(i).expect("Able to write row")
+    if args.print_table {
+        println!("{}", table);
+    }
+
+    if args.generate_csv {
+        let mut wtr = Writer::from_path("foo.csv").expect("expected valid csv writer");
+        for i in &tagged {
+            wtr.serialize(i).expect("Able to write row")
+        }
     }
 }
 
