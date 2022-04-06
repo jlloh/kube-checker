@@ -21,7 +21,7 @@ Written in Rust.
 ## Usage
 ```
 kube-checker/target/debug/kube-checker -h
-kube-checker 0.1.0
+kube-checker 0.2.0
 Clap command line arguments
 
 USAGE:
