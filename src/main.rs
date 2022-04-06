@@ -46,6 +46,7 @@ struct TaggedObject {
     node_selector_check: bool,
     qos_check: bool,
     image_check: bool,
+    image_url: String,
     total_cores: f32,
     replica_num: i32,
 }
@@ -96,7 +97,6 @@ async fn main() -> () {
                 Some(replica_num) => replica_num,
                 _ => 0,
             };
-            // .expect("Expected replica count");
             let pod_spec = deployment
                 .clone()
                 .spec
@@ -267,7 +267,7 @@ fn tag_object(
         .map(|container| {
             let container_name = container.name;
             let image = container.image.unwrap();
-            let image_check = is_ecr_image(image);
+            let image_check = is_ecr_image(&image) || is_hosted_image(&image);
             let qos_check = match &container.resources {
                 Some(resource) => resource.requests.is_some(),
                 None => false,
@@ -293,6 +293,7 @@ fn tag_object(
                 node_selector_check,
                 qos_check,
                 image_check,
+                image_url: image,
                 total_cores: cpu_request * replicas as f32 / 1000.0,
                 replica_num: replicas,
             }
@@ -301,8 +302,13 @@ fn tag_object(
     return results;
 }
 
-fn is_ecr_image(image: String) -> bool {
+fn is_ecr_image(image: &str) -> bool {
     return image.contains("amazonaws.com/");
+}
+
+// is hosted in somebody's repo somewhere. we assume this is more reliable than dockerhub
+fn is_hosted_image(image: &str) -> bool {
+    return image.contains("gcr.io") || image.contains("quay.io") || image.contains("ghcr.io");
 }
 
 #[cfg(test)]
@@ -318,7 +324,7 @@ mod tests {
     fn test_is_ecr_image() {
         let input =
             "095116963143.dkr.ecr.ap-southeast-1.amazonaws.com/datadog-agent:7.32.4".to_string();
-        assert_eq!(is_ecr_image(input), true);
+        assert_eq!(is_ecr_image(&input), true);
     }
 
     // TODO: Make this ugly struct a yaml file? read from a yaml file and marshal into struct

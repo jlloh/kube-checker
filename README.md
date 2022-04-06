@@ -36,5 +36,4 @@ OPTIONS:
 ```
 
 ### TODO
-* check daemonsets as well for 2nd and 3rd criteria above
-* image_check can be improved to include all non-dockerhub sources, e.g. GCR
+* Filters for specific checks? And also there are too many columsn now 
