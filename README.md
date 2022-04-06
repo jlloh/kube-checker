@@ -18,6 +18,22 @@
 
 Written in Rust.
 
+## Usage
+```
+kube-checker/target/debug/kube-checker -h
+kube-checker 0.2.0
+Clap command line arguments
+
+USAGE:
+    kube-checker [OPTIONS]
+
+OPTIONS:
+        --disable-filter    Disable filters so that all pods are displayed
+        --generate-csv      Generate a csv file in the directory, foo.csv
+    -h, --help              Print help information
+        --print-table       Print out the table to stdout
+    -V, --version           Print version information
+```
+
 ### TODO
-* check daemonsets as well for 2nd and 3rd criteria above
-* image_check can be improved to include all non-dockerhub sources, e.g. GCR
+* Filters for specific checks? And also there are too many columsn now 
