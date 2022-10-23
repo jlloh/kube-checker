@@ -14,3 +14,4 @@ tabled = "0.4.2"
 csv = "1.1"
 serde = { version = "1", features = ["derive"] }
 clap = { version = "3.1.8", features = ["derive"] }
+anyhow = "1.0.66"

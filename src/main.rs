@@ -1,13 +1,15 @@
+use std::collections::HashMap;
+
+use anyhow::{Context, Result};
 use clap::Parser;
 use csv::Writer;
 use futures::future::try_join_all;
-use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
-use k8s_openapi::api::core::v1::{Namespace, PodSpec};
+use k8s_openapi::api::core::v1::{Namespace, Pod, PodSpec};
 use kube::{
     api::{Api, ListParams, ObjectList},
     Client,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tabled::{Table, Tabled};
 
 mod utils;
@@ -27,15 +29,6 @@ struct Args {
     print_table: bool,
 }
 
-#[derive(Debug, Clone)]
-struct InputObject {
-    name: String,
-    namespace: String,
-    type_of: String,
-    pod_spec: PodSpec,
-    replicas: i32,
-}
-
 #[derive(Debug, Tabled, Clone, Serialize)]
 struct TaggedObject {
     name: String,
@@ -52,7 +45,7 @@ struct TaggedObject {
 }
 
 #[tokio::main]
-async fn main() -> () {
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     let client = Client::try_default()
@@ -68,120 +61,65 @@ async fn main() -> () {
         .map(|ns| ns.clone().metadata.name.expect("Expected namespace name"))
         .collect();
 
-    let mut waiters_deployments = Vec::new();
-    let mut waiters_statefulsets = Vec::new();
-    let mut waiters_daemonsets = Vec::new();
+    let mut join_handles = Vec::new();
 
     for namespace in namespace_list {
-        let handle_deployments = tokio::spawn(get_deployments(client.clone(), namespace.clone()));
-        let handle_statefulsets = tokio::spawn(get_statefulsets(client.clone(), namespace.clone()));
-        let handle_daemonsets = tokio::spawn(get_daemonsets(client.clone(), namespace.clone()));
-        waiters_deployments.push(handle_deployments);
-        waiters_statefulsets.push(handle_statefulsets);
-        waiters_daemonsets.push(handle_daemonsets);
+        let handle = tokio::spawn(get_pods(client.clone(), namespace.clone()));
+        join_handles.push(handle);
     }
 
-    let results_deployments: Vec<InputObject> = try_join_all(waiters_deployments)
+    let pod_level_results: Vec<TaggedObject> = try_join_all(join_handles)
         .await
-        .expect("Expected successful execution of async get deployments")
+        .context("Failed to execute tokio task for retrieving pods in namespace")?
         .iter()
         .flatten()
-        .map(|x| x.clone())
-        .map(|deployment| {
-            let replicas = match deployment
-                .clone()
-                .status
-                .expect("Expected statefulset status")
-                .replicas
-            {
-                Some(replica_num) => replica_num,
-                _ => 0,
+        .map(|pod| {
+            let pod_metadata = &pod.metadata;
+            // TODO: remove unwrap
+            let pod_spec = pod.spec.clone().unwrap();
+            let owners: String = match &pod_metadata.owner_references {
+                Some(references) => references
+                    .iter()
+                    .map(|reference| reference.clone().name)
+                    .collect::<Vec<String>>()
+                    .join(","),
+                None => "unknown".to_string(),
             };
-            let pod_spec = deployment
-                .clone()
-                .spec
-                .expect("Expected deployment spec")
-                .template
-                .spec
-                .expect("Expected spec");
-            let name = deployment
-                .clone()
-                .metadata
-                .name
-                .expect("Expected valid name");
-            let namespace = deployment
-                .clone()
-                .metadata
-                .namespace
-                .expect("Expected namespace value");
-            InputObject {
-                name,
-                namespace,
-                type_of: "deployment".to_string(),
-                pod_spec,
-                replicas,
-            }
-        })
-        .collect();
-
-    let results_statefulsets: Vec<InputObject> = try_join_all(waiters_statefulsets)
-        .await
-        .expect("Expected successful execution of async get statefulsets")
-        .iter()
-        .flatten()
-        .map(|x| x.clone())
-        .map(|statefulset| {
-            let replicas = statefulset
-                .clone()
-                .status
-                .expect("Expected statefulset status")
-                .replicas;
-            let pod_spec = statefulset
-                .clone()
-                .spec
-                .expect("Expected statefulset spec")
-                .template
-                .spec
-                .expect("Expected podspec");
-            let name = statefulset
-                .clone()
-                .metadata
-                .name
-                .expect("Expected valid name");
-            let namespace = statefulset
-                .clone()
-                .metadata
-                .namespace
-                .expect("Expected namespace value");
-            InputObject {
-                name,
-                namespace,
-                type_of: "statefulset".to_string(),
-                pod_spec,
-                replicas,
-            }
-        })
-        .collect();
-
-    let mut full_results = results_deployments.clone();
-    full_results.append(&mut results_statefulsets.clone());
-
-    let mut tagged: Vec<TaggedObject> = full_results
-        .into_iter()
-        .map(|input| {
             tag_object(
-                input.name,
-                input.namespace,
-                input.type_of,
-                &input.pod_spec,
-                input.replicas,
+                owners,
+                // TODO: remove unwrap
+                pod_metadata.clone().namespace.unwrap(),
+                "pod".to_string(),
+                &pod_spec,
+                1,
             )
         })
         .flatten()
         .collect();
-    tagged.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
 
-    let filtered: Vec<TaggedObject> = tagged
+    // Aggregate results
+    let initial_map: HashMap<String, TaggedObject> = HashMap::new();
+    let agg_map = pod_level_results.iter().fold(initial_map, |acc, x| {
+        let mut output = acc.clone();
+        let key = format!(
+            "{}-{}-{}-{}",
+            x.name, x.namespace, x.type_of, x.container_name
+        );
+        if let Some(inside) = acc.get(&key) {
+            let mut modified = inside.clone();
+            modified.replica_num = inside.replica_num + x.replica_num;
+            output.insert(key, modified);
+        } else {
+            output.insert(key, x.clone());
+        };
+        output
+    });
+
+    let mut final_vec: Vec<TaggedObject> = agg_map.values().cloned().collect();
+
+    final_vec.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+
+    let filtered: Vec<TaggedObject> = final_vec
         .clone()
         .into_iter()
         .filter(|x| !x.image_check || !x.node_selector_check || !x.qos_check)
@@ -190,7 +128,7 @@ async fn main() -> () {
     // Sort by resources without filtering
     let table: String;
     if args.disable_filter {
-        table = Table::new(&tagged).to_string();
+        table = Table::new(&final_vec).to_string();
     } else {
         table = Table::new(&filtered).to_string();
     }
@@ -201,41 +139,19 @@ async fn main() -> () {
 
     if args.generate_csv {
         let mut wtr = Writer::from_path("foo.csv").expect("expected valid csv writer");
-        for i in &tagged {
+        for i in &final_vec {
             wtr.serialize(i).expect("Able to write row")
         }
     }
+
+    Ok(())
 }
 
-async fn get_deployments(client: Client, namespace: String) -> ObjectList<Deployment> {
+async fn get_pods(client: Client, namespace: String) -> ObjectList<Pod> {
     let lp = ListParams::default();
-    let deployments: Api<Deployment> = Api::namespaced(client, &namespace);
-    let deployment_list = deployments
-        .list(&lp)
-        .await
-        .expect("Expected results for deployment list");
-    return deployment_list;
-}
-
-// Copy pasta for now
-async fn get_statefulsets(client: Client, namespace: String) -> ObjectList<StatefulSet> {
-    let lp = ListParams::default();
-    let deployments: Api<StatefulSet> = Api::namespaced(client, &namespace);
-    let deployment_list = deployments
-        .list(&lp)
-        .await
-        .expect("Expected results for deployment list");
-    return deployment_list;
-}
-
-async fn get_daemonsets(client: Client, namespace: String) -> ObjectList<DaemonSet> {
-    let lp = ListParams::default();
-    let daemonsets: Api<DaemonSet> = Api::namespaced(client, &namespace);
-    let daemonset_list = daemonsets
-        .list(&lp)
-        .await
-        .expect("Expected results for daemonset list");
-    return daemonset_list;
+    let pods: Api<Pod> = Api::namespaced(client, &namespace);
+    let pod_list = pods.list(&lp).await.expect("Expected results for pod list");
+    return pod_list;
 }
 
 fn convert_quantity_to_int(quantity: String) -> f32 {
