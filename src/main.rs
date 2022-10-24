@@ -1,13 +1,10 @@
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use csv::Writer;
 use futures::future::try_join_all;
-use k8s_openapi::{
-    api::core::v1::{Namespace, Pod, PodSpec},
-    apimachinery::pkg::api::resource::Quantity,
-};
+use k8s_openapi::api::core::v1::{Namespace, Pod, PodSpec};
 use kube::{
     api::{Api, ListParams, ObjectList},
     Client,
@@ -33,8 +30,8 @@ struct Args {
 }
 
 #[derive(Debug, Tabled, Clone, Serialize)]
-struct TaggedObject {
-    name: String,
+struct ExtractedAndTaggedObject {
+    object_name: String,
     namespace: String,
     type_of: String,
     container_name: String,
@@ -53,13 +50,13 @@ async fn main() -> Result<()> {
 
     let client = Client::try_default()
         .await
-        .expect("Expected client init succeed");
+        .context("Failed to init Kubernetes client")?;
 
     let namespaces: Api<Namespace> = Api::all(client.clone());
     let namespace_list: Vec<String> = namespaces
         .list(&ListParams::default())
         .await
-        .expect("Expected namespace list")
+        .context("Failed to list namespaces")?
         .iter()
         .map(|ns| ns.clone().metadata.name.expect("Expected namespace name"))
         .collect();
@@ -71,43 +68,149 @@ async fn main() -> Result<()> {
         join_handles.push(handle);
     }
 
-    let pod_level_results: Vec<TaggedObject> = try_join_all(join_handles)
+    let pod_level_results: Vec<ExtractedAndTaggedObject> = try_join_all(join_handles)
         .await
         .context("Failed to execute tokio task for retrieving pods in namespace")?
+        .into_iter()
+        .collect::<Result<Vec<ObjectList<Pod>>>>()
+        .context("Failed to get pods in namespace")?
         .iter()
         .flatten()
         .map(|pod| {
             let pod_metadata = &pod.metadata;
-            // TODO: remove unwrap
-            let pod_spec = pod.spec.clone().unwrap();
+            let pod_name = pod_metadata
+                .name
+                .clone()
+                .unwrap_or("no_pod_name".to_string());
+            let pod_spec = if let Some(spec) = pod.spec.clone() {
+                Ok(spec)
+            } else {
+                Err(anyhow!("No pod spec for pod {}", &pod_name))
+            }
+            .context("Unable to retrieve pod spec")?;
+            let namespace = if let Some(inside) = &pod_metadata.namespace {
+                Ok(inside)
+            } else {
+                Err(anyhow!("No namespace for pod {}", &pod_name))
+            }
+            .context("Unable to retrieve pod namespace")?;
             let owners: String = match &pod_metadata.owner_references {
                 Some(references) => references
                     .iter()
                     .map(|reference| reference.clone().name)
                     .collect::<Vec<String>>()
                     .join(","),
-                None => "unknown".to_string(),
+                None => format!("pod:{}", &pod_name),
             };
-            tag_object(
+            extract_containers_and_info(
                 owners,
-                // TODO: remove unwrap
-                pod_metadata.clone().namespace.unwrap(),
+                namespace.to_string(),
                 "pod".to_string(),
                 &pod_spec,
                 1,
             )
         })
+        .collect::<Result<Vec<Vec<ExtractedAndTaggedObject>>>>()
+        .context("Failed to extract containers and tag object")?
+        .into_iter()
         .flatten()
         .collect();
 
-    // Aggregate results
-    let initial_map: HashMap<String, TaggedObject> = HashMap::new();
-    let agg_map = pod_level_results.iter().fold(initial_map, |acc, x| {
+    // Aggregate results at container_name level
+    // let initial_map: HashMap<String, ExtractedAndTaggedObject> = HashMap::new();
+    // let agg_map = pod_level_results.iter().fold(initial_map, |acc, x| {
+    //     let mut output = acc.clone();
+    //     let key = format!(
+    //         "{}-{}-{}-{}",
+    //         x.object_name, x.namespace, x.type_of, x.container_name
+    //     );
+    //     if let Some(inside) = acc.get(&key) {
+    //         let mut modified = inside.clone();
+    //         modified.replica_num = inside.replica_num + x.replica_num;
+    //         modified.total_cores = inside.total_cores + x.total_cores;
+    //         output.insert(key, modified);
+    //     } else {
+    //         output.insert(key, x.clone());
+    //     };
+    //     output
+    // });
+
+    // let mut container_level_results: Vec<ExtractedAndTaggedObject> =
+    //     agg_map.values().cloned().collect();
+
+    // container_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    let container_level_results = agg_and_sort(&pod_level_results, &extract_container_level_key);
+
+    let filtered: Vec<ExtractedAndTaggedObject> = container_level_results
+        .clone()
+        .into_iter()
+        .filter(|x| !x.image_check || !x.node_selector_check || !x.qos_check)
+        .collect();
+
+    // Sort by resources without filtering
+    let table: String;
+    if args.disable_filter {
+        table = Table::new(&container_level_results).to_string();
+    } else {
+        table = Table::new(&filtered).to_string();
+    }
+
+    if args.print_table {
+        println!("{}", table);
+    }
+
+    // object level
+    let object_level_results = agg_and_sort(&container_level_results, &extract_object_level_key);
+    // let object_table = Table::new(&object_level_results).to_string();
+
+    if args.generate_csv {
+        let mut wtr =
+            Writer::from_path("results_by_container_name.csv").expect("expected valid csv writer");
+        for i in &container_level_results {
+            wtr.serialize(i).expect("Able to write row")
+        }
+
+        let mut obj_wtr =
+            Writer::from_path("results_by_object.csv").expect("expected valid csv writer");
+        for i in &object_level_results {
+            obj_wtr.serialize(i).expect("Able to write row")
+        }
+    }
+
+    Ok(())
+}
+
+async fn get_pods(client: Client, namespace: String) -> Result<ObjectList<Pod>> {
+    let lp = ListParams::default();
+    let pods: Api<Pod> = Api::namespaced(client, &namespace);
+    let pod_list = pods
+        .list(&lp)
+        .await
+        .context("Expected results for pod list")?;
+    Ok(pod_list)
+}
+
+// Extract container_level key for aggregation
+fn extract_container_level_key(x: &ExtractedAndTaggedObject) -> String {
+    format!(
+        "{}-{}-{}-{}",
+        x.object_name, x.namespace, x.type_of, x.container_name
+    )
+}
+
+// Extract object_level key for aggregation
+fn extract_object_level_key(x: &ExtractedAndTaggedObject) -> String {
+    format!("{}-{}-{}", x.object_name, x.namespace, x.type_of)
+}
+
+fn agg_and_sort(
+    input_vec: &Vec<ExtractedAndTaggedObject>,
+    function: &dyn Fn(&ExtractedAndTaggedObject) -> String,
+) -> Vec<ExtractedAndTaggedObject> {
+    let initial_map: HashMap<String, ExtractedAndTaggedObject> = HashMap::new();
+    let agg_map = input_vec.iter().fold(initial_map, |acc, x| {
         let mut output = acc.clone();
-        let key = format!(
-            "{}-{}-{}-{}",
-            x.name, x.namespace, x.type_of, x.container_name
-        );
+        let key = function(x);
         if let Some(inside) = acc.get(&key) {
             let mut modified = inside.clone();
             modified.replica_num = inside.replica_num + x.replica_num;
@@ -119,60 +222,37 @@ async fn main() -> Result<()> {
         output
     });
 
-    let mut final_vec: Vec<TaggedObject> = agg_map.values().cloned().collect();
+    let mut results: Vec<ExtractedAndTaggedObject> = agg_map.values().cloned().collect();
 
-    final_vec.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
-
-    let filtered: Vec<TaggedObject> = final_vec
-        .clone()
-        .into_iter()
-        .filter(|x| !x.image_check || !x.node_selector_check || !x.qos_check)
-        .collect();
-
-    // Sort by resources without filtering
-    let table: String;
-    if args.disable_filter {
-        table = Table::new(&final_vec).to_string();
-    } else {
-        table = Table::new(&filtered).to_string();
-    }
-
-    if args.print_table {
-        println!("{}", table);
-    }
-
-    if args.generate_csv {
-        let mut wtr = Writer::from_path("foo.csv").expect("expected valid csv writer");
-        for i in &final_vec {
-            wtr.serialize(i).expect("Able to write row")
-        }
-    }
-
-    Ok(())
+    results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    results
 }
 
-async fn get_pods(client: Client, namespace: String) -> ObjectList<Pod> {
-    let lp = ListParams::default();
-    let pods: Api<Pod> = Api::namespaced(client, &namespace);
-    let pod_list = pods.list(&lp).await.expect("Expected results for pod list");
-    return pod_list;
-}
-
-fn convert_quantity_to_int(quantity: String) -> f32 {
+fn convert_quantity_to_int(quantity: String) -> Result<f32> {
     match quantity {
-        x if x.contains("m") => x.replace("m", "").parse::<f32>().unwrap(),
-        x if x.contains("g") => x.replace("g", "").parse::<f32>().unwrap() * 1000.0,
-        _ => quantity.parse::<f32>().unwrap() * 1000.0,
+        x if x.contains('m') => Ok(x
+            .replace("m", "")
+            .parse::<f32>()
+            .context(format!("Failed to parse {} as int", &x))?),
+        x if x.contains('g') => Ok(x
+            .replace("g", "")
+            .parse::<f32>()
+            .context(format!("Failed to parse {} as int", &x))?
+            * 1000.0),
+        _ => Ok(quantity
+            .parse::<f32>()
+            .context(format!("Failed to parse {} as int", &quantity))?
+            * 1000.0),
     }
 }
 
-fn tag_object(
+fn extract_containers_and_info(
     name: String,
     namespace: String,
     type_of: String,
     pod_spec: &PodSpec,
     replicas: i32,
-) -> Vec<TaggedObject> {
+) -> Result<Vec<ExtractedAndTaggedObject>> {
     // qos class BestEffort?
     // let bad_qos_class = pod_spec.clone().
     // dockerhub image
@@ -182,7 +262,7 @@ fn tag_object(
         _ => "None".to_string(),
     };
     let containers = pod_spec.clone().containers;
-    let results: Vec<TaggedObject> = containers
+    let results: Result<Vec<ExtractedAndTaggedObject>> = containers
         .into_iter()
         .map(|container| {
             let container_name = container.name;
@@ -200,36 +280,40 @@ fn tag_object(
                     if let Some(inside) = cpu_request {
                         convert_quantity_to_int(inside.clone().0)
                     } else {
-                        0.0
+                        Ok(0.0)
                     }
                 }
-                _ => 0.0,
+                _ => Ok(0.0),
             };
-            TaggedObject {
-                name: name.clone(),
-                namespace: namespace.clone(),
-                type_of: type_of.clone(),
-                container_name,
-                node_selectors: node_selectors.clone(),
-                node_selector_check,
-                qos_check,
-                image_check,
-                image_url: image,
-                total_cores: cpu_request * replicas as f32 / 1000.0,
-                replica_num: replicas,
+            if let Ok(inside) = cpu_request {
+                Ok(ExtractedAndTaggedObject {
+                    object_name: name.clone(),
+                    namespace: namespace.clone(),
+                    type_of: type_of.clone(),
+                    container_name,
+                    node_selectors: node_selectors.clone(),
+                    node_selector_check,
+                    qos_check,
+                    image_check,
+                    image_url: image,
+                    total_cores: inside * replicas as f32 / 1000.0,
+                    replica_num: replicas,
+                })
+            } else {
+                Err(cpu_request.err().unwrap())
             }
         })
         .collect();
-    return results;
+    results
 }
 
 fn is_ecr_image(image: &str) -> bool {
-    return image.contains("amazonaws.com/");
+    image.contains("amazonaws.com/")
 }
 
 // is hosted in somebody's repo somewhere. we assume this is more reliable than dockerhub
 fn is_hosted_image(image: &str) -> bool {
-    return image.contains("gcr.io") || image.contains("quay.io") || image.contains("ghcr.io");
+    image.contains("gcr.io") || image.contains("quay.io") || image.contains("ghcr.io")
 }
 
 #[cfg(test)]
@@ -239,13 +323,12 @@ mod tests {
     // use k8s_openapi::apimachinery::pkg::api::resource::quantity;
     use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
     use std::collections::BTreeMap;
-    use utils;
 
     #[test]
     fn test_is_ecr_image() {
         let input =
             "095116963143.dkr.ecr.ap-southeast-1.amazonaws.com/datadog-agent:7.32.4".to_string();
-        assert_eq!(is_ecr_image(&input), true);
+        assert!(is_ecr_image(&input));
     }
 
     // TODO: Make this ugly struct a yaml file? read from a yaml file and marshal into struct
@@ -273,19 +356,20 @@ mod tests {
             ..utils::get_empty_pod_spec()
         };
 
-        let tagged_result = tag_object(
+        let tagged_result = extract_containers_and_info(
             "random name".to_string(),
             "namespace".to_string(),
             "deployment".to_string(),
             &pod_spec,
             10,
-        );
+        )
+        .unwrap();
 
         assert_ne!(tagged_result.len(), 0);
         let x = tagged_result.first().unwrap();
-        assert_eq!(x.image_check, true);
-        assert_eq!(x.node_selector_check, true);
-        assert_eq!(x.qos_check, true);
+        assert!(x.image_check);
+        assert!(x.node_selector_check);
+        assert!(x.qos_check);
     }
 
     #[test]
@@ -306,18 +390,19 @@ mod tests {
             ..utils::get_empty_pod_spec()
         };
 
-        let tagged_result = tag_object(
+        let tagged_result = extract_containers_and_info(
             "random name".to_string(),
             "namespace".to_string(),
             "deployment".to_string(),
             &pod_spec,
             10,
-        );
+        )
+        .unwrap();
 
         assert_ne!(tagged_result.len(), 0);
         let x = tagged_result.first().unwrap();
-        assert_eq!(x.image_check, false);
-        assert_eq!(x.node_selector_check, false);
-        assert_eq!(x.qos_check, false);
+        assert!(x.image_check);
+        assert!(x.node_selector_check);
+        assert!(x.qos_check);
     }
 }
