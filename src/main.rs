@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use csv::Writer;
 use futures::future::try_join_all;
-use k8s_openapi::api::core::v1::{Namespace, Pod, PodSpec};
+use k8s_openapi::{
+    api::core::v1::{Namespace, Pod, PodSpec},
+    apimachinery::pkg::api::resource::Quantity,
+};
 use kube::{
     api::{Api, ListParams, ObjectList},
     Client,
@@ -108,6 +111,7 @@ async fn main() -> Result<()> {
         if let Some(inside) = acc.get(&key) {
             let mut modified = inside.clone();
             modified.replica_num = inside.replica_num + x.replica_num;
+            modified.total_cores = inside.total_cores + x.total_cores;
             output.insert(key, modified);
         } else {
             output.insert(key, x.clone());
@@ -189,15 +193,16 @@ fn tag_object(
                 None => false,
             };
             let cpu_request = match container.resources {
-                Some(resource) if resource.requests.is_some() => convert_quantity_to_int(
-                    resource
-                        .requests
-                        .expect("Expected requests")
-                        .get("cpu")
-                        .unwrap()
-                        .clone()
-                        .0,
-                ),
+                Some(resource) if resource.requests.is_some() => {
+                    // println!("Resource request is {:?}", resource);
+                    let requests = resource.requests.expect("Expected request");
+                    let cpu_request = requests.get("cpu");
+                    if let Some(inside) = cpu_request {
+                        convert_quantity_to_int(inside.clone().0)
+                    } else {
+                        0.0
+                    }
+                }
                 _ => 0.0,
             };
             TaggedObject {
