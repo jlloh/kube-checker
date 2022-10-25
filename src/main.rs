@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 use tabled::{Table, Tabled};
 use tokio::sync::mpsc::{channel, Sender};
 mod utils;
+use rayon::prelude::*;
 
 /// Clap command line arguments
 #[derive(Parser, Debug)]
@@ -113,7 +114,8 @@ async fn main() -> Result<()> {
         }
     }
     info!("Sorting container level results");
-    container_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    container_level_results
+        .par_sort_unstable_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
 
     let filtered: Vec<ExtractedAndTaggedObject> = container_level_results
         .clone()
@@ -138,7 +140,8 @@ async fn main() -> Result<()> {
     let mut object_level_results =
         agg_and_sort(&container_level_results, &extract_object_level_key);
     info!("Sorting object level results");
-    object_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    object_level_results
+        .par_sort_unstable_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
     //     .unwrap();
     // let object_table = Table::new(&object_level_results).to_string();
 
