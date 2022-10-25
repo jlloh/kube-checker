@@ -2,7 +2,6 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use csv::Writer;
 use env_logger::Env;
-use futures::future::try_join_all;
 use k8s_openapi::api::core::v1::{Namespace, Pod, PodSpec};
 use kube::{
     api::{Api, ListParams, ObjectList},
@@ -110,17 +109,17 @@ async fn main() -> Result<()> {
     }
     drop(sender_2);
 
-    let mut pod_level_results = Vec::new();
+    let mut container_level_results = Vec::new();
     loop {
         let results = receiver_2.recv().await;
         if let Some(inside) = results {
             let mut x = inside?;
-            pod_level_results.append(&mut x);
+            container_level_results.append(&mut x);
         } else {
             break;
         }
     }
-    pod_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    container_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
     // for pod_list_result in receiver.recv().await {
     //     let pod_list = pod_list_result?;
     //     rayon::spawn(move || {
@@ -176,10 +175,10 @@ async fn main() -> Result<()> {
     //     .flatten()
     //     .collect();
 
-    info!("Aggregating results at container_level...");
-    let mut container_level_results =
-        agg_and_sort(&pod_level_results, &extract_container_level_key);
-    container_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    // info!("Aggregating results at container_level...");
+    // let mut container_level_results =
+    //     agg_and_sort(&container_level_results, &extract_container_level_key);
+    // container_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
     //     .unwrap();
 
     let filtered: Vec<ExtractedAndTaggedObject> = container_level_results
@@ -202,7 +201,10 @@ async fn main() -> Result<()> {
 
     // object level
     info!("Aggregating results at object_level...");
-    let object_level_results = agg_and_sort(&container_level_results, &extract_object_level_key);
+    let mut object_level_results =
+        agg_and_sort(&container_level_results, &extract_object_level_key);
+    object_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    //     .unwrap();
     // let object_table = Table::new(&object_level_results).to_string();
 
     if args.generate_csv {
@@ -315,7 +317,7 @@ fn agg_and_sort(
         output
     });
 
-    let mut results: Vec<ExtractedAndTaggedObject> = agg_map.values().cloned().collect();
+    let results: Vec<ExtractedAndTaggedObject> = agg_map.values().cloned().collect();
 
     results
 }
