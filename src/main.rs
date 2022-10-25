@@ -12,6 +12,7 @@ use log::info;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use tabled::{Table, Tabled};
+use tokio::sync::mpsc::{channel, Sender};
 mod utils;
 
 /// Clap command line arguments
@@ -64,62 +65,122 @@ async fn main() -> Result<()> {
         .collect();
 
     let mut join_handles = Vec::new();
+    let namespace_len = &namespace_list.len();
 
+    let (sender, mut receiver) = channel(*namespace_len);
     for namespace in namespace_list {
-        let handle = tokio::spawn(get_pods(client.clone(), namespace.clone()));
+        let handle = tokio::spawn(get_pods(client.clone(), namespace.clone(), sender.clone()));
         join_handles.push(handle);
     }
+    drop(sender);
 
-    let pod_level_results: Vec<ExtractedAndTaggedObject> = try_join_all(join_handles)
-        .await
-        .context("Failed to execute tokio task for retrieving pods in namespace")?
-        .into_iter()
-        .collect::<Result<Vec<ObjectList<Pod>>>>()
-        .context("Failed to get pods in namespace")?
-        .iter()
-        .flatten()
-        .map(|pod| {
-            let pod_metadata = &pod.metadata;
-            let pod_name = pod_metadata
-                .name
-                .clone()
-                .unwrap_or("no_pod_name".to_string());
-            let pod_spec = if let Some(spec) = pod.spec.clone() {
-                Ok(spec)
-            } else {
-                Err(anyhow!("No pod spec for pod {}", &pod_name))
-            }
-            .context("Unable to retrieve pod spec")?;
-            let namespace = if let Some(inside) = &pod_metadata.namespace {
-                Ok(inside)
-            } else {
-                Err(anyhow!("No namespace for pod {}", &pod_name))
-            }
-            .context("Unable to retrieve pod namespace")?;
-            let owners: String = match &pod_metadata.owner_references {
-                Some(references) => references
-                    .iter()
-                    .map(|reference| reference.clone().name)
-                    .collect::<Vec<String>>()
-                    .join("|"),
-                None => format!("pod:{}", &pod_name),
-            };
-            extract_containers_and_info(
-                owners,
-                namespace.to_string(),
-                "pod".to_string(),
-                &pod_spec,
-                1,
-            )
-        })
-        .collect::<Result<Vec<Vec<ExtractedAndTaggedObject>>>>()
-        .context("Failed to extract containers and tag object")?
-        .into_iter()
-        .flatten()
-        .collect();
+    let (sender_2, mut receiver_2) = channel(*namespace_len);
+    loop {
+        // tokio::select! {
+        let pod_list_result = receiver.recv().await;
+        if let Some(pod_list) = pod_list_result {
+            let pods = pod_list?;
+            let sender = sender_2.clone();
+            rayon::spawn(move || {
+                info!("Spawning task to aggregate and sort results");
+                let containers_result: Result<Vec<Vec<ExtractedAndTaggedObject>>> =
+                    pods.into_iter().map(process_pod).collect();
+                let aggregated = match containers_result {
+                    Ok(containers) => Ok(agg_and_sort(
+                        &containers.into_iter().flatten().collect(),
+                        &extract_container_level_key,
+                    )),
+                    Err(e) => Err(e),
+                };
+                sender
+                    .try_send(aggregated)
+                    // .await
+                    .expect("Failed send aggregated results from task");
+            });
+        } else {
+            break;
+        }
+
+        // }
+        // _ = try_join_all(join_handles) => {
+        //     // Tokio threads have finished sending pod results to channel
+        //     // Should I break the loop?
+        //     break
+        // }
+    }
+    drop(sender_2);
+
+    let mut pod_level_results = Vec::new();
+    loop {
+        let results = receiver_2.recv().await;
+        if let Some(inside) = results {
+            let mut x = inside?;
+            pod_level_results.append(&mut x);
+        } else {
+            break;
+        }
+    }
+    pod_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    // for pod_list_result in receiver.recv().await {
+    //     let pod_list = pod_list_result?;
+    //     rayon::spawn(move || {
+    //         let containers = pod_list.into_iter().map(process_pod);
+    //     });
+    // }
+
+    // let pod_level_results: Vec<ExtractedAndTaggedObject> = try_join_all(join_handles)
+    //     .await
+    //     .context("Failed to execute tokio task for retrieving pods in namespace")?
+    //     .into_iter()
+    //     .collect::<Result<Vec<ObjectList<Pod>>>>()
+    //     .context("Failed to get pods in namespace")?
+    //     .iter()
+    //     .flatten()
+    //     .map(|pod| {
+    //         let pod_metadata = &pod.metadata;
+    //         let pod_name = pod_metadata
+    //             .name
+    //             .clone()
+    //             .unwrap_or("no_pod_name".to_string());
+    //         let pod_spec = if let Some(spec) = pod.spec.clone() {
+    //             Ok(spec)
+    //         } else {
+    //             Err(anyhow!("No pod spec for pod {}", &pod_name))
+    //         }
+    //         .context("Unable to retrieve pod spec")?;
+    //         let namespace = if let Some(inside) = &pod_metadata.namespace {
+    //             Ok(inside)
+    //         } else {
+    //             Err(anyhow!("No namespace for pod {}", &pod_name))
+    //         }
+    //         .context("Unable to retrieve pod namespace")?;
+    //         let owners: String = match &pod_metadata.owner_references {
+    //             Some(references) => references
+    //                 .iter()
+    //                 .map(|reference| reference.clone().name)
+    //                 .collect::<Vec<String>>()
+    //                 .join("|"),
+    //             None => format!("pod:{}", &pod_name),
+    //         };
+    //         extract_containers_and_info(
+    //             owners,
+    //             namespace.to_string(),
+    //             "pod".to_string(),
+    //             &pod_spec,
+    //             1,
+    //         )
+    //     })
+    //     .collect::<Result<Vec<Vec<ExtractedAndTaggedObject>>>>()
+    //     .context("Failed to extract containers and tag object")?
+    //     .into_iter()
+    //     .flatten()
+    //     .collect();
 
     info!("Aggregating results at container_level...");
-    let container_level_results = agg_and_sort(&pod_level_results, &extract_container_level_key);
+    let mut container_level_results =
+        agg_and_sort(&pod_level_results, &extract_container_level_key);
+    container_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    //     .unwrap();
 
     let filtered: Vec<ExtractedAndTaggedObject> = container_level_results
         .clone()
@@ -161,7 +222,47 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn get_pods(client: Client, namespace: String) -> Result<ObjectList<Pod>> {
+fn process_pod(pod: Pod) -> Result<Vec<ExtractedAndTaggedObject>> {
+    let pod_metadata = &pod.metadata;
+    let pod_name = pod_metadata
+        .name
+        .clone()
+        .unwrap_or("no_pod_name".to_string());
+    let pod_spec = if let Some(spec) = pod.spec.clone() {
+        Ok(spec)
+    } else {
+        Err(anyhow!("No pod spec for pod {}", &pod_name))
+    }
+    .context("Unable to retrieve pod spec")?;
+    let namespace = if let Some(inside) = &pod_metadata.namespace {
+        Ok(inside)
+    } else {
+        Err(anyhow!("No namespace for pod {}", &pod_name))
+    }
+    .context("Unable to retrieve pod namespace")?;
+    let owners: String = match &pod_metadata.owner_references {
+        Some(references) => references
+            .iter()
+            .map(|reference| reference.clone().name)
+            .collect::<Vec<String>>()
+            .join("|"),
+        None => format!("pod:{}", &pod_name),
+    };
+    extract_containers_and_info(
+        owners,
+        namespace.to_string(),
+        "pod".to_string(),
+        &pod_spec,
+        1,
+    )
+}
+
+async fn get_pods(
+    client: Client,
+    namespace: String,
+    sender: Sender<Result<ObjectList<Pod>>>,
+) -> Result<()> {
+    //Result<ObjectList<Pod>> {
     info!("Retrieving pods for namespace {}", &namespace);
     let lp = ListParams::default();
     let pods: Api<Pod> = Api::namespaced(client, &namespace);
@@ -170,7 +271,12 @@ async fn get_pods(client: Client, namespace: String) -> Result<ObjectList<Pod>> 
         .await
         .context("Expected results for pod list")?;
     info!("Finished retrieving pods for namespace {}", &namespace);
-    Ok(pod_list)
+    sender
+        .send(Ok(pod_list))
+        .await
+        .context("Failed to send pod results to channel")?;
+    Ok(())
+    // Ok(pod_list)
 }
 
 // Extract container_level key for aggregation
@@ -196,7 +302,7 @@ fn agg_and_sort(
         let key = function(x);
         if let Some(inside) = acc.get(&key) {
             // It's a little inefficient to convert between hashset and string for every loop. But to be fixed later
-            let mut current_items: HashSet<&str> = HashSet::from_iter(inside.containers.split("|"));
+            let mut current_items: HashSet<&str> = HashSet::from_iter(inside.containers.split('|'));
             let mut modified = inside.clone();
             modified.total_items = inside.total_items + x.total_items;
             modified.total_cores = inside.total_cores + x.total_cores;
@@ -211,7 +317,6 @@ fn agg_and_sort(
 
     let mut results: Vec<ExtractedAndTaggedObject> = agg_map.values().cloned().collect();
 
-    results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
     results
 }
 
