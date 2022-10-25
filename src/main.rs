@@ -1,17 +1,17 @@
-use std::collections::HashMap;
-
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use csv::Writer;
+use env_logger::Env;
 use futures::future::try_join_all;
 use k8s_openapi::api::core::v1::{Namespace, Pod, PodSpec};
 use kube::{
     api::{Api, ListParams, ObjectList},
     Client,
 };
+use log::info;
 use serde::Serialize;
+use std::collections::{HashMap, HashSet};
 use tabled::{Table, Tabled};
-
 mod utils;
 
 /// Clap command line arguments
@@ -34,18 +34,19 @@ struct ExtractedAndTaggedObject {
     object_name: String,
     namespace: String,
     type_of: String,
-    container_name: String,
+    containers: String,
     node_selectors: String,
     node_selector_check: bool,
     qos_check: bool,
     image_check: bool,
     image_url: String,
     total_cores: f32,
-    replica_num: i32,
+    total_items: i32,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
     let client = Client::try_default()
@@ -53,6 +54,7 @@ async fn main() -> Result<()> {
         .context("Failed to init Kubernetes client")?;
 
     let namespaces: Api<Namespace> = Api::all(client.clone());
+    info!("Retrieving namespaces");
     let namespace_list: Vec<String> = namespaces
         .list(&ListParams::default())
         .await
@@ -99,7 +101,7 @@ async fn main() -> Result<()> {
                     .iter()
                     .map(|reference| reference.clone().name)
                     .collect::<Vec<String>>()
-                    .join(","),
+                    .join("|"),
                 None => format!("pod:{}", &pod_name),
             };
             extract_containers_and_info(
@@ -116,29 +118,7 @@ async fn main() -> Result<()> {
         .flatten()
         .collect();
 
-    // Aggregate results at container_name level
-    // let initial_map: HashMap<String, ExtractedAndTaggedObject> = HashMap::new();
-    // let agg_map = pod_level_results.iter().fold(initial_map, |acc, x| {
-    //     let mut output = acc.clone();
-    //     let key = format!(
-    //         "{}-{}-{}-{}",
-    //         x.object_name, x.namespace, x.type_of, x.container_name
-    //     );
-    //     if let Some(inside) = acc.get(&key) {
-    //         let mut modified = inside.clone();
-    //         modified.replica_num = inside.replica_num + x.replica_num;
-    //         modified.total_cores = inside.total_cores + x.total_cores;
-    //         output.insert(key, modified);
-    //     } else {
-    //         output.insert(key, x.clone());
-    //     };
-    //     output
-    // });
-
-    // let mut container_level_results: Vec<ExtractedAndTaggedObject> =
-    //     agg_map.values().cloned().collect();
-
-    // container_level_results.sort_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
+    info!("Aggregating results at container_level...");
     let container_level_results = agg_and_sort(&pod_level_results, &extract_container_level_key);
 
     let filtered: Vec<ExtractedAndTaggedObject> = container_level_results
@@ -160,6 +140,7 @@ async fn main() -> Result<()> {
     }
 
     // object level
+    info!("Aggregating results at object_level...");
     let object_level_results = agg_and_sort(&container_level_results, &extract_object_level_key);
     // let object_table = Table::new(&object_level_results).to_string();
 
@@ -181,12 +162,14 @@ async fn main() -> Result<()> {
 }
 
 async fn get_pods(client: Client, namespace: String) -> Result<ObjectList<Pod>> {
+    info!("Retrieving pods for namespace {}", &namespace);
     let lp = ListParams::default();
     let pods: Api<Pod> = Api::namespaced(client, &namespace);
     let pod_list = pods
         .list(&lp)
         .await
         .context("Expected results for pod list")?;
+    info!("Finished retrieving pods for namespace {}", &namespace);
     Ok(pod_list)
 }
 
@@ -194,7 +177,7 @@ async fn get_pods(client: Client, namespace: String) -> Result<ObjectList<Pod>> 
 fn extract_container_level_key(x: &ExtractedAndTaggedObject) -> String {
     format!(
         "{}-{}-{}-{}",
-        x.object_name, x.namespace, x.type_of, x.container_name
+        x.object_name, x.namespace, x.type_of, x.containers
     )
 }
 
@@ -212,9 +195,13 @@ fn agg_and_sort(
         let mut output = acc.clone();
         let key = function(x);
         if let Some(inside) = acc.get(&key) {
+            // It's a little inefficient to convert between hashset and string for every loop. But to be fixed later
+            let mut current_items: HashSet<&str> = HashSet::from_iter(inside.containers.split("|"));
             let mut modified = inside.clone();
-            modified.replica_num = inside.replica_num + x.replica_num;
+            modified.total_items = inside.total_items + x.total_items;
             modified.total_cores = inside.total_cores + x.total_cores;
+            current_items.insert(&x.containers);
+            modified.containers = Vec::from_iter(current_items).join("|");
             output.insert(key, modified);
         } else {
             output.insert(key, x.clone());
@@ -290,14 +277,14 @@ fn extract_containers_and_info(
                     object_name: name.clone(),
                     namespace: namespace.clone(),
                     type_of: type_of.clone(),
-                    container_name,
+                    containers: container_name,
                     node_selectors: node_selectors.clone(),
                     node_selector_check,
                     qos_check,
                     image_check,
                     image_url: image,
                     total_cores: inside * replicas as f32 / 1000.0,
-                    replica_num: replicas,
+                    total_items: replicas,
                 })
             } else {
                 Err(cpu_request.err().unwrap())
