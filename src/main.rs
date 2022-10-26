@@ -124,12 +124,11 @@ async fn main() -> Result<()> {
         .collect();
 
     // Sort by resources without filtering
-    let table: String;
-    if args.disable_filter {
-        table = Table::new(&container_level_results).to_string();
+    let table = if args.disable_filter {
+        Table::new(&container_level_results).to_string()
     } else {
-        table = Table::new(&filtered).to_string();
-    }
+        Table::new(&filtered).to_string()
+    };
 
     if args.print_table {
         println!("{}", table);
@@ -255,19 +254,20 @@ fn agg_and_sort(
         output
     });
 
-    let results: Vec<ExtractedAndTaggedObject> = agg_map.values().cloned().collect();
+    let mut results: Vec<ExtractedAndTaggedObject> = agg_map.values().cloned().collect();
 
+    results.par_sort_unstable_by(|a, b| b.total_cores.partial_cmp(&a.total_cores).unwrap());
     results
 }
 
 fn convert_quantity_to_int(quantity: String) -> Result<f32> {
     match quantity {
         x if x.contains('m') => Ok(x
-            .replace("m", "")
+            .replace('m', "")
             .parse::<f32>()
             .context(format!("Failed to parse {} as int", &x))?),
         x if x.contains('g') => Ok(x
-            .replace("g", "")
+            .replace('g', "")
             .parse::<f32>()
             .context(format!("Failed to parse {} as int", &x))?
             * 1000.0),
